@@ -1,0 +1,3 @@
+openai==0.28.1
+pyaudio==0.2.11
+wave
