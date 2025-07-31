@@ -1,10 +1,18 @@
 [project]
 name = "obs-realtime-translator"
 version = "0.1.0"
-description = "Add your description here"
+description = "OBS Studio Real-Time Translation Tool for Japanese-English translation"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "openai>=1.98.0",
+    "pyaudio>=0.2.11",
+    "rich>=13.0.0",
+    "python-dotenv>=1.0.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "websockets>=12.0",
+]
 
 [dependency-groups]
 dev = [
