@@ -1,7 +1,5 @@
 import os
-import tkinter as tk
-from tkinter import simpledialog, messagebox
-import openai
+from openai import OpenAI
 import pyaudio
 import wave
 import threading
@@ -10,6 +8,22 @@ import signal
 import sys
 import tempfile
 import time
+import getpass
+import asyncio
+import json
+from datetime import datetime
+from typing import List, Dict, Any
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+from rich.prompt import Prompt
+from rich.live import Live
+from rich.table import Table
+from rich import print as rprint
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+import uvicorn
 
 # グローバル変数の設定
 FORMAT = pyaudio.paInt16
@@ -24,6 +38,13 @@ running = False
 record_thread = None
 process_thread = None
 last_translation = ""
+console = Console()
+client = None
+
+# Web server components
+app = FastAPI(title="OBS Real-Time Translation", version="1.0.0")
+active_websockets: List[WebSocket] = []
+translation_history: List[Dict[str, Any]] = []
 
 def record_audio():
     global running
@@ -31,32 +52,60 @@ def record_audio():
     stream = None
     try:
         audio = pyaudio.PyAudio()
-        stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
         
-        overlap_frames = []
+        # Use non-blocking stream with larger buffer for macOS
+        stream = audio.open(
+            format=FORMAT, 
+            channels=CHANNELS, 
+            rate=RATE, 
+            input=True, 
+            frames_per_buffer=CHUNK * 4,  # Larger buffer for macOS
+            input_device_index=None,  # Use default device
+            stream_callback=None
+        )
+        
+        console.print("[green]🎤 Audio stream started[/green]")
         
         while running:
             frames = []
-            # 6秒間録音（英語のより長い文章に対応）
-            for _ in range(0, int(RATE / CHUNK * 6)):
-                if not running:
-                    break
-                frame_data = stream.read(CHUNK)
-                frames.append(frame_data)
-            
-            # シンプルに録音データを使用
-            combined_frames = frames
-            audio_data = b''.join(combined_frames)
-            audio_queue.put(audio_data)
+            # Record for 6 seconds with overflow protection
+            try:
+                for _ in range(0, int(RATE / CHUNK * 6)):
+                    if not running:
+                        break
+                    # Non-blocking read with exception handling
+                    try:
+                        frame_data = stream.read(CHUNK, exception_on_overflow=False)
+                        frames.append(frame_data)
+                    except Exception as read_error:
+                        console.print(f"[yellow]⚠️  Audio read warning: {read_error}[/yellow]")
+                        # Skip this chunk and continue
+                        continue
+                
+                if frames:  # Only process if we have audio data
+                    audio_data = b''.join(frames)
+                    audio_queue.put(audio_data)
+                    
+            except Exception as chunk_error:
+                console.print(f"[yellow]⚠️  Audio chunk error: {chunk_error}[/yellow]")
+                time.sleep(0.1)  # Brief pause before retry
     
     except Exception as e:
-        print(f"Recording error: {e}")
+        console.print(f"[red]❌ Recording error: {e}[/red]")
     finally:
-        if stream:
-            stream.stop_stream()
-            stream.close()
-        if audio:
-            audio.terminate()
+        try:
+            if stream and stream.is_active():
+                stream.stop_stream()
+            if stream:
+                stream.close()
+        except:
+            pass  # Ignore cleanup errors
+        try:
+            if audio:
+                audio.terminate()
+        except:
+            pass  # Ignore cleanup errors
+        console.print("[dim]🔇 Audio stream closed[/dim]")
 
 def process_audio():
     while running:
@@ -78,8 +127,8 @@ def process_audio():
                         text = None
                         for retry in range(3):  # 最大3回リトライ
                             try:
-                                response = openai.Audio.transcribe(model="whisper-1", file=audio_file)
-                                text = response['text']
+                                response = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
+                                text = response.text
                                 break  # 成功したらループを抜ける
                             except Exception as api_error:
                                 print(f"API error (attempt {retry + 1}/3): {api_error}")
@@ -163,7 +212,7 @@ def process_audio():
                     # 各翻訳は独立して実行される
                     
                 except Exception as e:
-                    print(f"Error processing audio: {e}")
+                    console.print(f"[yellow]⚠️  Error processing audio: {e}[/yellow]")
                 finally:
                     # 一時ファイルをクリーンアップ
                     if os.path.exists(temp_wav):
@@ -172,7 +221,7 @@ def process_audio():
                         except:
                             pass
         except Exception as outer_e:
-            print(f"Error in process_audio loop: {outer_e}")
+            console.print(f"[yellow]⚠️  Error in process_audio loop: {outer_e}[/yellow]")
             # エラーが発生しても処理を続行
             time.sleep(0.1)  # 短時間待機してから次のループへ
 
@@ -204,15 +253,19 @@ def detect_language(text):
     else:
         return "en"
 
+
 def translate_and_update(text):
     try:
+        detected_lang = detect_language(text)
         translated_text = translate_text(text)
         if translated_text and len(translated_text.strip()) > 0:
             update_subtitle_file(translated_text)
+            # Broadcast to web interface
+            broadcast_translation(text, translated_text, detected_lang)
         else:
-            print(f"Translation failed or empty for: {text}")
+            console.print(f"[yellow]Translation failed or empty for: {text}[/yellow]")
     except Exception as e:
-        print(f"Error in translate_and_update: {e}")
+        console.print(f"[red]Error in translate_and_update: {e}[/red]")
         # エラーが発生しても処理を続行
 
 def translate_text(text):
@@ -276,7 +329,7 @@ Return only the translation. Do not add explanations, comments, or notes."""
     translation = None
     for retry in range(3):  # 最大3回リトライ
         try:
-            response = openai.ChatCompletion.create(
+            response = client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -284,7 +337,7 @@ Return only the translation. Do not add explanations, comments, or notes."""
                 ],
                 temperature=temperature
             )
-            translation = response['choices'][0]['message']['content'].strip()
+            translation = response.choices[0].message.content.strip()
             break  # 成功したらループを抜ける
         except Exception as api_error:
             print(f"Translation API error (attempt {retry + 1}/3): {api_error}")
@@ -383,9 +436,65 @@ def update_subtitle_file(text):
         # OBS用に1行ずつ上書き（追記ではなく上書き）
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(text)
-        print(f"Updated subtitle to: {text}")
+        console.print(f"[blue]📝 Subtitle:[/blue] {text}")
     except Exception as e:
         print(f"Failed to update subtitle: {e}")
+
+async def broadcast_to_websockets(message_type: str, data: dict):
+    """Broadcast message to all connected WebSocket clients"""
+    if not active_websockets:
+        return
+        
+    message = json.dumps({
+        "type": message_type,
+        "data": data
+    })
+    
+    # Send to all connected clients
+    disconnected = []
+    for websocket in active_websockets:
+        try:
+            await websocket.send_text(message)
+        except Exception:
+            disconnected.append(websocket)
+    
+    # Remove disconnected clients
+    for ws in disconnected:
+        if ws in active_websockets:
+            active_websockets.remove(ws)
+
+def broadcast_translation(original_text: str, translated_text: str, detected_lang: str):
+    """Broadcast translation to web clients"""
+    try:
+        # Add to history
+        timestamp = datetime.now().isoformat()
+        translation_data = {
+            "timestamp": timestamp,
+            "original": original_text,
+            "translation": translated_text,
+            "detected_language": detected_lang,
+            "source_lang": "🇯🇵 Japanese" if detected_lang == "ja" else "🇺🇸 English",
+            "target_lang": "🇺🇸 English" if detected_lang == "ja" else "🇯🇵 Japanese"
+        }
+        
+        translation_history.append(translation_data)
+        if len(translation_history) > 50:  # Keep last 50
+            translation_history.pop(0)
+        
+        # Broadcast to WebSocket clients (run in thread to avoid blocking)
+        def run_broadcast():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(broadcast_to_websockets("translation", translation_data))
+                loop.close()
+            except Exception as e:
+                console.print(f"[yellow]⚠️  Web broadcast error: {e}[/yellow]")
+        
+        threading.Thread(target=run_broadcast, daemon=True).start()
+        
+    except Exception as e:
+        console.print(f"[yellow]⚠️  Broadcast setup error: {e}[/yellow]")
 
 def start_recording():
     global running, record_thread, process_thread
@@ -395,7 +504,8 @@ def start_recording():
         process_thread = threading.Thread(target=process_audio)
         record_thread.start()
         process_thread.start()
-        print("Started recording")
+        console.print("[green]✓ Started recording and translation[/green]")
+        
 
 def stop_recording():
     global running, record_thread, process_thread
@@ -406,40 +516,476 @@ def stop_recording():
             record_thread.join(timeout=2)
         if process_thread and process_thread.is_alive():
             process_thread.join(timeout=2)
-        print("Stopped recording")
+        console.print("[red]✗ Stopped recording and translation[/red]")
+        
 
 # Ctrl + C (SIGINT) に対応するハンドラ
 def signal_handler(sig, frame):
-    print("Ctrl + C detected! Stopping recording...")
+    console.print("\n[yellow]⚠️  Ctrl + C detected! Stopping recording...[/yellow]")
     stop_recording()
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
 
-# Tkinterの設定
-root = tk.Tk()
-root.title("リアルタイム翻訳システム")
-root.geometry("400x200")
+# Web Routes
+@app.get("/", response_class=HTMLResponse)
+async def get_viewer():
+    """Serve the main translation viewer page"""
+    html_content = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎙️ Real-Time Translation Viewer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh; padding: 20px; color: white;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header {
+            text-align: center; margin-bottom: 30px;
+            background: rgba(255, 255, 255, 0.1); padding: 20px;
+            border-radius: 15px; backdrop-filter: blur(10px);
+        }
+        .header h1 { font-size: 2.5em; margin-bottom: 10px; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
+        .status {
+            padding: 15px; border-radius: 10px; margin-bottom: 20px;
+            text-align: center; font-weight: bold; transition: all 0.3s ease;
+        }
+        .status.connected { background: rgba(76, 175, 80, 0.8); }
+        .status.disconnected { background: rgba(244, 67, 54, 0.8); }
+        .status.recording { background: rgba(255, 152, 0, 0.8); animation: pulse 2s infinite; }
+        @keyframes pulse { 0% { opacity: 0.8; } 50% { opacity: 1; } 100% { opacity: 0.8; } }
+        .translation-container {
+            background: rgba(255, 255, 255, 0.1); border-radius: 15px;
+            backdrop-filter: blur(10px); min-height: 500px;
+            overflow-y: auto; max-height: 70vh;
+        }
+        .translation-item {
+            padding: 20px; border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            animation: slideIn 0.5s ease; transition: background 0.3s ease;
+        }
+        .translation-item:hover { background: rgba(255, 255, 255, 0.05); }
+        .translation-item:last-child { border-bottom: none; }
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .timestamp { font-size: 0.8em; opacity: 0.7; margin-bottom: 8px; }
+        .language-indicator {
+            display: inline-block; padding: 4px 8px; border-radius: 12px;
+            font-size: 0.7em; font-weight: bold; margin-right: 10px;
+        }
+        .lang-ja { background: rgba(255, 87, 87, 0.8); }
+        .lang-en { background: rgba(74, 144, 226, 0.8); }
+        .original-text {
+            font-size: 1.1em; margin-bottom: 10px; padding: 10px;
+            background: rgba(0, 0, 0, 0.2); border-radius: 8px;
+            border-left: 4px solid #4CAF50;
+        }
+        .translated-text {
+            font-size: 1.2em; font-weight: 500; padding: 15px;
+            background: rgba(255, 255, 255, 0.15); border-radius: 8px;
+            border-left: 4px solid #2196F3;
+        }
+        .no-translations {
+            text-align: center; padding: 50px; opacity: 0.7; font-size: 1.1em;
+        }
+        .stats {
+            display: flex; justify-content: space-around; margin-top: 20px;
+            background: rgba(255, 255, 255, 0.1); padding: 15px; border-radius: 10px;
+        }
+        .stat-item { text-align: center; }
+        .stat-number { font-size: 1.5em; font-weight: bold; display: block; }
+        .connection-indicator {
+            position: fixed; top: 20px; right: 20px; width: 12px; height: 12px;
+            border-radius: 50%; background: #f44336; transition: background 0.3s ease;
+        }
+        .connection-indicator.connected {
+            background: #4CAF50; box-shadow: 0 0 10px rgba(76, 175, 80, 0.5);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎙️ Real-Time Translation Viewer</h1>
+            <p>Japanese ⇔ English Live Translation</p>
+        </div>
+        
+        <div id="status" class="status disconnected">🔴 Connecting to translation service...</div>
+        
+        <div class="translation-container">
+            <div id="translations">
+                <div class="no-translations">
+                    <h3>🎵 Waiting for translations...</h3>
+                    <p>Start speaking into your microphone to see live translations appear here!</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="stats">
+            <div class="stat-item">
+                <span id="total-translations" class="stat-number">0</span>
+                <span>Total Translations</span>
+            </div>
+            <div class="stat-item">
+                <span id="session-time" class="stat-number">00:00</span>
+                <span>Session Time</span>
+            </div>
+            <div class="stat-item">
+                <span id="connection-status" class="stat-number">🔴</span>
+                <span>Connection</span>
+            </div>
+        </div>
+    </div>
+    
+    <div id="connection-indicator" class="connection-indicator"></div>
 
-# APIキーの入力プロンプト
-api_key = simpledialog.askstring(title="OpenAI API Key", prompt="Please enter your OpenAI API key:")
+    <script>
+        class TranslationViewer {
+            constructor() {
+                this.ws = null;
+                this.translationCount = 0;
+                this.sessionStart = new Date();
+                this.setupWebSocket();
+                this.startSessionTimer();
+            }
+            
+            setupWebSocket() {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/ws`;
+                
+                try {
+                    this.ws = new WebSocket(wsUrl);
+                    
+                    this.ws.onopen = () => {
+                        console.log('WebSocket connected');
+                        this.updateConnectionStatus(true);
+                    };
+                    
+                    this.ws.onmessage = (event) => {
+                        const message = JSON.parse(event.data);
+                        this.handleMessage(message);
+                    };
+                    
+                    this.ws.onclose = () => {
+                        console.log('WebSocket disconnected');
+                        this.updateConnectionStatus(false);
+                        setTimeout(() => this.setupWebSocket(), 3000);
+                    };
+                    
+                    this.ws.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        this.updateConnectionStatus(false);
+                    };
+                } catch (error) {
+                    console.error('Failed to create WebSocket:', error);
+                    this.updateConnectionStatus(false);
+                }
+            }
+            
+            handleMessage(message) {
+                switch (message.type) {
+                    case 'translation':
+                        this.addTranslation(message.data);
+                        break;
+                    case 'status':
+                        this.updateStatus(message.data);
+                        break;
+                    case 'history':
+                        this.loadHistory(message.data);
+                        break;
+                }
+            }
+            
+            addTranslation(data) {
+                const container = document.getElementById('translations');
+                const noTranslations = container.querySelector('.no-translations');
+                if (noTranslations) {
+                    noTranslations.remove();
+                }
+                
+                const translationElement = this.createTranslationElement(data);
+                container.insertBefore(translationElement, container.firstChild);
+                
+                this.translationCount++;
+                document.getElementById('total-translations').textContent = this.translationCount;
+                
+                const translations = container.querySelectorAll('.translation-item');
+                if (translations.length > 20) {
+                    translations[translations.length - 1].remove();
+                }
+            }
+            
+            createTranslationElement(data) {
+                const div = document.createElement('div');
+                div.className = 'translation-item';
+                
+                const timestamp = new Date(data.timestamp).toLocaleTimeString();
+                const sourceLang = data.detected_language === 'ja' ? 'ja' : 'en';
+                
+                div.innerHTML = `
+                    <div class="timestamp">${timestamp}</div>
+                    <div class="original-text">
+                        <span class="language-indicator lang-${sourceLang}">${data.source_lang}</span>
+                        ${data.original}
+                    </div>
+                    <div class="translated-text">
+                        <span class="language-indicator lang-${sourceLang === 'ja' ? 'en' : 'ja'}">${data.target_lang}</span>
+                        ${data.translation}
+                    </div>
+                `;
+                
+                return div;
+            }
+            
+            updateStatus(data) {
+                const statusElement = document.getElementById('status');
+                let statusClass = 'connected';
+                let statusText = '';
+                
+                switch (data.status) {
+                    case 'recording':
+                        statusClass = 'recording';
+                        statusText = '🔴 Recording and translating...';
+                        break;
+                    case 'stopped':
+                        statusClass = 'connected';
+                        statusText = '⏸️ Translation stopped';
+                        break;
+                    case 'error':
+                        statusClass = 'disconnected';
+                        statusText = `❌ Error: ${data.message}`;
+                        break;
+                    default:
+                        statusText = `ℹ️ ${data.message}`;
+                }
+                
+                statusElement.className = `status ${statusClass}`;
+                statusElement.textContent = statusText;
+            }
+            
+            updateConnectionStatus(connected) {
+                const indicator = document.getElementById('connection-indicator');
+                const statusSpan = document.getElementById('connection-status');
+                const statusDiv = document.getElementById('status');
+                
+                if (connected) {
+                    indicator.classList.add('connected');
+                    statusSpan.textContent = '🟢';
+                    statusDiv.className = 'status connected';
+                    statusDiv.textContent = '🟢 Connected to translation service';
+                } else {
+                    indicator.classList.remove('connected');
+                    statusSpan.textContent = '🔴';
+                    statusDiv.className = 'status disconnected';
+                    statusDiv.textContent = '🔴 Disconnected - Attempting to reconnect...';
+                }
+            }
+            
+            startSessionTimer() {
+                setInterval(() => {
+                    const elapsed = new Date() - this.sessionStart;
+                    const minutes = Math.floor(elapsed / 60000);
+                    const seconds = Math.floor((elapsed % 60000) / 1000);
+                    document.getElementById('session-time').textContent = 
+                        `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                }, 1000);
+            }
+        }
+        
+        document.addEventListener('DOMContentLoaded', () => {
+            new TranslationViewer();
+        });
+    </script>
+</body>
+</html>
+    '''
+    return HTMLResponse(content=html_content)
 
-if not api_key:
-    messagebox.showerror("Error", "API key is required to proceed.")
-    root.destroy()
-    exit()
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_websockets.append(websocket)
+    console.print(f"[green]🌐 New WebSocket connection. Total: {len(active_websockets)}[/green]")
+    
+    # Send recent translation history to new connection
+    if translation_history:
+        await websocket.send_text(json.dumps({
+            "type": "history",
+            "data": translation_history[-10:]  # Last 10 translations
+        }))
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        if websocket in active_websockets:
+            active_websockets.remove(websocket)
+        console.print(f"[yellow]🔌 WebSocket disconnected. Total: {len(active_websockets)}[/yellow]")
 
-openai.api_key = api_key
+@app.get("/api/status")
+async def get_status():
+    """API endpoint to get current server status"""
+    return {
+        "status": "running",
+        "active_connections": len(active_websockets),
+        "total_translations": len(translation_history),
+        "recording": running,
+        "timestamp": datetime.now().isoformat()
+    }
 
-# GUIのボタン設定
-start_button = tk.Button(root, text="開始", command=start_recording)
-start_button.pack(pady=10)
+def check_audio_devices():
+    """Check available audio input devices"""
+    try:
+        audio = pyaudio.PyAudio()
+        console.print("\n[cyan]🎤 Available Audio Input Devices:[/cyan]")
+        
+        default_device = None
+        for i in range(audio.get_device_count()):
+            device_info = audio.get_device_info_by_index(i)
+            if device_info['maxInputChannels'] > 0:
+                is_default = " [green](default)[/green]" if i == audio.get_default_input_device_info()['index'] else ""
+                console.print(f"  {i}: {device_info['name']}{is_default}")
+                if is_default:
+                    default_device = device_info
+        
+        if default_device:
+            console.print(f"\n[green]✓ Using default device: {default_device['name']}[/green]")
+        
+        audio.terminate()
+        return True
+    except Exception as e:
+        console.print(f"[red]❌ Error checking audio devices: {e}[/red]")
+        return False
 
-stop_button = tk.Button(root, text="停止", command=stop_recording)
-stop_button.pack(pady=10)
+def main():
+    global client
+    
+    # Rich console header
+    console.print(Panel.fit(
+        "[bold blue]🎙️  OBS Real-Time Translation Tool[/bold blue]\n"
+        "[dim]Japanese ⇔ English Real-time Translation[/dim]\n"
+        "[dim]Created by: minta[/dim]",
+        border_style="blue"
+    ))
+    
+    # Check audio devices first
+    if not check_audio_devices():
+        console.print("[red]❌ Cannot access audio devices. Check microphone permissions.[/red]")
+        sys.exit(1)
+    
+    # Load environment variables from .env file
+    load_dotenv()
+    
+    # Try to get API key from environment first
+    api_key = os.getenv('OPENAI_API_KEY')
+    
+    if api_key:
+        console.print(f"[green]✅ Found API key in environment (.env file)[/green]")
+        # Mask the key for display
+        masked_key = api_key[:7] + "..." + api_key[-4:] if len(api_key) > 11 else "sk-..."
+        console.print(f"[dim]Using key: {masked_key}[/dim]")
+    else:
+        # API key input with Rich
+        console.print("\n[yellow]🔑 No API key found in .env file[/yellow]")
+        console.print("[dim]Tip: Create a .env file with OPENAI_API_KEY=sk-your-key-here[/dim]")
+        console.print("\n[yellow]Please enter your OpenAI API key:[/yellow]")
+        api_key = getpass.getpass("API Key (sk-...): ")
+    
+    if not api_key or not api_key.startswith('sk-'):
+        console.print("[red]❌ Error: Valid API key is required to proceed.[/red]")
+        sys.exit(1)
+    
+    try:
+        client = OpenAI(api_key=api_key)
+        console.print("[green]✅ API key validated[/green]")
+    except Exception as e:
+        console.print(f"[red]❌ Error: Invalid API key - {e}[/red]")
+        sys.exit(1)
+    
+    # Status table
+    table = Table(show_header=True, title="📊 System Status")
+    table.add_column("Component", style="cyan")
+    table.add_column("Status", style="green")
+    table.add_row("Audio Input", "✅ Ready")
+    table.add_row("OpenAI API", "✅ Connected")
+    table.add_row("Subtitle File", f"✅ {file_path}")
+    
+    console.print(table)
+    
+    # Start web server in background thread
+    def start_web_server():
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="error")
+    
+    web_thread = threading.Thread(target=start_web_server, daemon=True)
+    web_thread.start()
+    time.sleep(2)  # Give web server time to start
+    
+    console.print("[green]✅ Web server started at http://localhost:8000[/green]")
+    
+    # Interactive menu
+    console.print("\n[bold yellow]🎯 Commands:[/bold yellow]")
+    console.print("• [green]start[/green] - Begin recording and translation")
+    console.print("• [red]stop[/red] - Stop recording and translation") 
+    console.print("• [yellow]status[/yellow] - Show current status")
+    console.print("• [cyan]web[/cyan] - Open web viewer (http://localhost:8000)")
+    console.print("• [red]quit[/red] - Exit the application")
+    console.print("• [dim]Ctrl+C - Emergency stop[/dim]")
+    
+    console.print(f"\n[bold green]🌐 Web Viewer:[/bold green] [link]http://localhost:8000[/link]")
+    
+    # Main loop
+    while True:
+        try:
+            command = Prompt.ask("\n[bold]Enter command", choices=["start", "stop", "status", "web", "quit"], default="start")
+            
+            if command == "start":
+                if not running:
+                    start_recording()
+                else:
+                    console.print("[yellow]⚠️  Already recording![/yellow]")
+                    
+            elif command == "stop":
+                if running:
+                    stop_recording()
+                else:
+                    console.print("[yellow]⚠️  Not currently recording![/yellow]")
+                    
+            elif command == "status":
+                status = "🟢 Recording" if running else "🔴 Stopped"
+                console.print(f"[bold]Status:[/bold] {status}")
+                console.print(f"[bold]Subtitle file:[/bold] {file_path}")
+                console.print(f"[bold]Last translation:[/bold] {last_translation or 'None'}")
+                console.print(f"[bold]Web server:[/bold] http://localhost:8000")
+                console.print(f"[bold]Web connections:[/bold] {len(active_websockets)}")
+                
+            elif command == "web":
+                import webbrowser
+                try:
+                    webbrowser.open("http://localhost:8000")
+                    console.print("[green]🌐 Opening web viewer in browser...[/green]")
+                except Exception as e:
+                    console.print(f"[red]Could not open browser: {e}[/red]")
+                    console.print("[dim]Manually open: http://localhost:8000[/dim]")
+                
+            elif command == "quit":
+                if running:
+                    stop_recording()
+                console.print("[blue]👋 Goodbye![/blue]")
+                break
+                
+        except KeyboardInterrupt:
+            signal_handler(signal.SIGINT, None)
+        except Exception as e:
+            console.print(f"[red]❌ Error: {e}[/red]")
 
-# 作成者のラベル
-author_label = tk.Label(root, text="コード作成者：minta", font=("Arial", 8))
-author_label.pack(side="bottom")
-
-root.mainloop()
+if __name__ == "__main__":
+    main()
